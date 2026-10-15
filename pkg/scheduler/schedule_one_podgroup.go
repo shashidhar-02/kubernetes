@@ -193,7 +193,7 @@ func (sched *Scheduler) updatePodGroupConditionWithError(ctx context.Context, pg
 		Reason:  cpgReason,
 		Message: err.Error(),
 	})
-	for _, child := range pgi.GetChildGroups() {
+	for _, child := range pgi.Children {
 		sched.updatePodGroupConditionWithError(ctx, child, err)
 	}
 }
@@ -319,7 +319,7 @@ func (sched *Scheduler) validatePodGroupSubtree(
 	}
 
 	if podGroupInfo.GetType() == fwk.CompositePodGroupKeyType {
-		for _, child := range podGroupInfo.GetChildGroups() {
+		for _, child := range podGroupInfo.Children {
 			if err := sched.validatePodGroupSubtree(child, podGroupInfo, depth+1, validateChildPodGroup, validatePod); err != nil {
 				return err
 			}
@@ -426,21 +426,31 @@ func (sched *Scheduler) podGroupCycle(ctx context.Context, schedFwk framework.Fr
 	// Run pod group post filter plugins if scheduling failed. If any of the plugins is successful,
 	// we need to put the pods from pod group back into the scheduling queue.
 	if rootStatus.Code() == fwk.Unschedulable {
-		var pgSchedulingFunc fwk.PodGroupSchedulingFunc = func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
-			results := sched.runRootSchedulingAlgorithm(ctx, schedFwk, framework.NewCycleState(), rootPodGroupInfo)
-			proposedAssignments := make([]fwk.ProposedAssignment, 0)
-			for _, res := range results {
-				proposedAssignments = append(proposedAssignments, makeProposedAssignments(res)...)
-			}
-			return &fwk.PodGroupAssignments{
-				ProposedAssignments: proposedAssignments,
-			}, results[rootPodGroupInfo.PodGroupInfo.GetKey()].status
-		}
+		pgSchedulingFunc := sched.buildPodGroupSchedulingFunc(schedFwk, rootPodGroupInfo)
 		pgPostFilterResult, status := schedFwk.RunPodGroupPostFilterPlugins(ctx, podGroupCycleState, rootPodGroupInfo.PodGroupInfo, pgSchedulingFunc)
 		applyPodGroupPostFilterResult(completePGResults, pgPostFilterResult, status)
 	}
 
 	sched.submitPodGroupAlgorithmResult(ctx, schedFwk, podGroupCycleState, rootPodGroupInfo, completePGResults, start, rootStatus)
+}
+
+// buildPodGroupSchedulingFunc returns a PodGroupSchedulingFunc that evaluates the root pod group
+// hierarchy and collects proposed assignments from successful leaf pod groups in tree-walk order.
+func (sched *Scheduler) buildPodGroupSchedulingFunc(schedFwk framework.Framework, rootPodGroupInfo *framework.QueuedPodGroupInfo) fwk.PodGroupSchedulingFunc {
+	return func(ctx context.Context) (*fwk.PodGroupAssignments, *fwk.Status) {
+		results := sched.runRootSchedulingAlgorithm(ctx, schedFwk, framework.NewCycleState(), rootPodGroupInfo)
+		rootResult := results[rootPodGroupInfo.PodGroupInfo.GetKey()]
+		if !rootResult.status.IsSuccess() {
+			return nil, rootResult.status
+		}
+		proposedAssignments := make([]fwk.ProposedAssignment, 0)
+		for res := range successfulLeafResults(rootPodGroupInfo.PodGroupInfo, results) {
+			proposedAssignments = append(proposedAssignments, makeProposedAssignments(res)...)
+		}
+		return &fwk.PodGroupAssignments{
+			ProposedAssignments: proposedAssignments,
+		}, rootResult.status
+	}
 }
 
 // runRootSchedulingAlgorithm orchestrates the scheduling attempt for a root pod group.
@@ -685,7 +695,7 @@ func completeCompositePodGroupAlgorithmResultMap(ctx context.Context, podGroupIn
 		result.status = parentResult.status.Clone()
 	}
 	if podGroupInfo.CompositePodGroup != nil {
-		for _, child := range podGroupInfo.GetChildGroups() {
+		for _, child := range podGroupInfo.Children {
 			completeCompositePodGroupAlgorithmResultMap(ctx, child, pgResults, result)
 		}
 	}
@@ -1537,7 +1547,7 @@ func (sched *Scheduler) compositePodGroupSchedulingDefaultAlgorithm(ctx context.
 	}
 
 	anyScheduled := false
-	for _, childPGInfo := range podGroupInfo.GetChildGroups() {
+	for _, childPGInfo := range podGroupInfo.Children {
 		childPodGroupState := framework.NewCycleState()
 		childPodGroupState.SetPlacementCycleState(placementCycleState)
 		childResult, childRevertFns := sched.podGroupSchedulingRecursiveAlgorithm(ctx, schedFwk, childPodGroupState, root, childPGInfo, results)

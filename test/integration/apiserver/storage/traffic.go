@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -264,6 +265,7 @@ func RunWatchTraffic(ctx context.Context, store storage.Interface, objects []typ
 	var wg sync.WaitGroup
 	for range cfg.Concurrency {
 		wg.Go(func() {
+			var cachedObj runtime.Object
 			for {
 				select {
 				case <-ctx.Done():
@@ -272,21 +274,47 @@ func RunWatchTraffic(ctx context.Context, store storage.Interface, objects []typ
 					return
 				default:
 				}
-				request := randomWatchRequest(ctx, store, objects, cfg.RequestDistribution)
+				request := randomWatchRequest(ctx, store, objects, cfg.RequestDistribution, cachedObj)
+				if request == nil {
+					continue
+				}
 				mode := WatcherFast
 				if len(cfg.RequestDistribution.WatcherBehavior) > 0 {
 					mode = PickRandom(cfg.RequestDistribution.WatcherBehavior)
 				}
-				response := runWatch(ctx, store, request, mode, cfg)
+				start := time.Now()
+				response := runWatch(ctx, store, *request, mode, cfg)
+				if ev := lastNonErrorEvent(response.Events); ev != nil {
+					cachedObj = ev.Object
+				}
 
 				mu.Lock()
-				watches = append(watches, correctness.WatchOperation{Request: request, Response: response})
+				watches = append(watches, correctness.WatchOperation{Request: *request, Response: response})
 				mu.Unlock()
+
+				if elapsed := time.Since(start); elapsed < cfg.HiccupDuration {
+					select {
+					case <-ctx.Done():
+						return
+					case <-stop:
+						return
+					case <-time.After(cfg.HiccupDuration - elapsed):
+					}
+				}
 			}
 		})
 	}
 	wg.Wait()
 	return watches
+}
+
+func lastNonErrorEvent(events []watch.Event) *watch.Event {
+	for i := len(events) - 1; i >= 0; i-- {
+		if ev := events[i]; ev.Type != watch.Error && ev.Object != nil {
+			return &ev
+		}
+	}
+	return nil
 }
 
 func randomRequest(ctx context.Context, store storage.Interface, keys []types.NamespacedName, dist RequestDistribution, cached runtime.Object) *correctness.Request {
@@ -336,7 +364,7 @@ func randomRequest(ctx context.Context, store storage.Interface, keys []types.Na
 			},
 		}
 	case correctness.OpGet:
-		rv, ok := pickResourceVersion(ctx, store, dist.Get.ResourceVersion, cached)
+		rv, ok := resolveResourceVersion(ctx, store, PickRandom(dist.Get.ResourceVersion), cached)
 		if !ok {
 			return nil
 		}
@@ -365,7 +393,7 @@ func randomRequest(ctx context.Context, store storage.Interface, keys []types.Na
 		default:
 			panic(fmt.Sprintf("%v: unknown list scope", scope))
 		}
-		rv, ok := pickResourceVersion(ctx, store, dist.List.ResourceVersion, cached)
+		rv, ok := resolveResourceVersion(ctx, store, PickRandom(dist.List.ResourceVersion), cached)
 		if !ok {
 			return nil
 		}
@@ -418,8 +446,8 @@ func randomRequest(ctx context.Context, store storage.Interface, keys []types.Na
 	}
 }
 
-func pickResourceVersion(ctx context.Context, store storage.Interface, dist []ChoiceWeight[RVType], cached runtime.Object) (string, bool) {
-	switch rvType := PickRandom(dist); rvType {
+func resolveResourceVersion(ctx context.Context, store storage.Interface, rvType RVType, cached runtime.Object) (string, bool) {
+	switch rvType {
 	case RVEmpty:
 		return "", true
 	case RVZero:
@@ -438,9 +466,9 @@ func pickResourceVersion(ctx context.Context, store storage.Interface, dist []Ch
 	case RVCurrent:
 		return relativeRV(ctx, store, 0), true
 	case RVPast:
-		return relativeRV(ctx, store, -int64(1+rand.Intn(10))), true
+		return relativeRV(ctx, store, -int64(1+rand.Intn(200))), true
 	case RVFuture:
-		return relativeRV(ctx, store, int64(1+rand.Intn(10))), true
+		return relativeRV(ctx, store, int64(1+rand.Intn(200))), true
 	default:
 		panic(fmt.Sprintf("%v: unknown RVType", rvType))
 	}
@@ -529,7 +557,7 @@ func runTraffic(ctx context.Context, store storage.Interface, request *correctne
 		panic(fmt.Sprintf("%v: unknown operation", request.Op))
 	}
 	if err != nil {
-		if _, ok := errors.AsType[*storage.StorageError](err); ok || storage.IsTooLargeResourceVersion(err) || errors.Is(err, errDeleteRejected) || errors.Is(err, errUpdateRejected) {
+		if _, ok := errors.AsType[*storage.StorageError](err); ok || storage.IsTooLargeResourceVersion(err) || apierrors.IsTooManyRequests(err) || errors.Is(err, errDeleteRejected) || errors.Is(err, errUpdateRejected) {
 			return correctness.Response{
 				Err: err,
 			}
@@ -542,28 +570,15 @@ func runTraffic(ctx context.Context, store storage.Interface, request *correctne
 	return response
 }
 
-func randomWatchRequest(ctx context.Context, store storage.Interface, keys []types.NamespacedName, distribution WatchDistribution) correctness.WatchRequest {
-	var rv string
+func randomWatchRequest(ctx context.Context, store storage.Interface, keys []types.NamespacedName, distribution WatchDistribution, cached runtime.Object) *correctness.WatchRequest {
 	watchList := PickRandom(distribution.SendInitialEvents)
 	selected := PickRandom(distribution.ResourceVersion)
 	for watchList && selected == RVFuture {
 		selected = PickRandom(distribution.ResourceVersion)
 	}
-	switch selected {
-	case RVEmpty:
-		rv = ""
-	case RVZero:
-		rv = "0"
-	case RVOne:
-		rv = "1"
-	case RVCurrent:
-		rv = relativeRV(ctx, store, 0)
-	case RVPast:
-		rv = relativeRV(ctx, store, -int64(1+rand.Intn(10)))
-	case RVFuture:
-		rv = relativeRV(ctx, store, int64(1+rand.Intn(10)))
-	default:
-		panic(fmt.Sprintf("%v: unknown watch request type", selected))
+	rv, ok := resolveResourceVersion(ctx, store, selected, cached)
+	if !ok {
+		return nil
 	}
 
 	key := pickKeyTarget(keys[rand.Intn(len(keys))], distribution.KeyTarget)
@@ -600,7 +615,7 @@ func randomWatchRequest(ctx context.Context, store storage.Interface, keys []typ
 		opts.SendInitialEvents = new(false)
 		opts.ResourceVersionMatch = metav1.ResourceVersionMatchNotOlderThan
 	}
-	return correctness.WatchRequest{Key: watchKey, Options: opts}
+	return &correctness.WatchRequest{Key: watchKey, Options: opts}
 }
 
 func pickPredicate(key types.NamespacedName, fieldDist []ChoiceWeight[FieldSelector], labelDist []ChoiceWeight[LabelSelector]) storage.SelectionPredicate {
@@ -663,7 +678,11 @@ func relativeRV(ctx context.Context, store storage.Interface, offset int64) stri
 }
 
 func runWatch(ctx context.Context, store storage.Interface, req correctness.WatchRequest, mode WatcherBehavior, cfg WatchConfig) correctness.WatchResponse {
-	watchCtx := ctx
+	// Cacher schedules a pre-timeout bookmark 2s before the context deadline.
+	// Setting a deadline just over 2s triggers periodic bookmarks within the
+	// test watch window while timer.C still terminates the watch after cfg.Duration.
+	watchCtx, cancel := context.WithTimeout(ctx, 2*time.Second+cfg.HiccupDuration)
+	defer cancel()
 	switch parts := strings.Split(strings.Trim(req.Key, "/"), "/"); len(parts) {
 	case 2:
 		watchCtx = genericapirequest.WithNamespace(watchCtx, parts[1])
@@ -674,7 +693,7 @@ func runWatch(ctx context.Context, store storage.Interface, req correctness.Watc
 
 	w, err := store.Watch(watchCtx, req.Key, req.Options)
 	if err != nil {
-		if _, ok := errors.AsType[*storage.StorageError](err); ok {
+		if _, ok := errors.AsType[*storage.StorageError](err); ok || apierrors.IsTooManyRequests(err) {
 			return correctness.WatchResponse{Err: err}
 		}
 		panic(err)

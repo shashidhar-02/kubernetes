@@ -169,7 +169,6 @@ const (
 
 	// owner: @aramase
 	// kep: https://kep.k8s.io/3299
-	// deprecated: v1.28
 	//
 	// Enables KMS v1 API for encryption at rest.
 	KMSv1 featuregate.Feature = "KMSv1"
@@ -209,6 +208,19 @@ const (
 	// Enables populating "enum" field of OpenAPI schemas
 	// in the spec returned from kube-apiserver.
 	OpenAPIEnums featuregate.Feature = "OpenAPIEnums"
+
+	// owner: @seans3
+	//
+	// Defers building the /openapi/v2 spec until the first request instead
+	// of building it eagerly at server startup, reducing apiserver memory on
+	// clusters where the endpoint is not exercised. Served content, ETags
+	// and update semantics are unchanged once built. A spec that fails to
+	// build no longer fails startup: the server's own /openapi/v2 serves 503,
+	// and the aggregated /openapi/v2 omits that server's APIs, as it does for
+	// any delegate whose spec is unavailable. With this feature enabled
+	// GenericAPIServer.StaticOpenAPISpec builds the spec on its first Get
+	// rather than during PrepareRun.
+	OpenAPIV2LazyBuild featuregate.Feature = "OpenAPIV2LazyBuild"
 
 	// owner: @stlaz
 	//
@@ -437,6 +449,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 	OpenAPIEnums: {
 		{Version: version.MustParse("1.23"), Default: false, PreRelease: featuregate.Alpha},
 		{Version: version.MustParse("1.24"), Default: true, PreRelease: featuregate.Beta},
+	},
+
+	OpenAPIV2LazyBuild: {
+		{Version: version.MustParse("1.38"), Default: true, PreRelease: featuregate.Beta},
 	},
 
 	RemoteRequestHeaderUID: {
